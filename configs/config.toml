@@ -1,0 +1,18 @@
+[gravity]
+domain = "gravity"
+host = "0.0.0.0"
+port = 30338
+pingInterval = 10
+maxPingsOutstanding = 3
+maxReconnects = -1
+
+[adapter]
+adapterID = "jetstream_adapter"
+adapterName = "JetStream Adapter"
+
+# Authentication
+appID = "anonymous"
+accessKey = ""
+
+[source]
+config = "./settings/sources.json"
