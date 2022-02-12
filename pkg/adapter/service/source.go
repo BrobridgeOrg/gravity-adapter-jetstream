@@ -193,11 +193,6 @@ func (source *Source) HandleMessage(m *nats.Msg) {
 	request.EventName = eventName
 	request.Payload = StrToBytes(payload)
 
-	//TODO
-	log.Info(string(m.Data))
-	log.Info(request.EventName)
-	log.Info(string(request.Payload))
-
 	for {
 		connector := source.adapter.app.GetAdapterConnector()
 		err := connector.Publish(request.EventName, request.Payload, nil)
