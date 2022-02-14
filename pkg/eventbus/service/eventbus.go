@@ -58,7 +58,7 @@ func (eb *EventBus) Connect() error {
 
 	eb.connection = nc
 
-	// Connect to NATS Streaming
+	// Connect to NATS JetStream
 	err = eb.ConnectToJetStream()
 	if err != nil {
 		return err
@@ -71,7 +71,7 @@ func (eb *EventBus) ConnectToJetStream() error {
 
 	log.WithFields(log.Fields{
 		"clientName": eb.options.ClientName,
-	}).Info("Connecting to NATS Streaming")
+	}).Info("Connecting to NATS JetStream")
 
 	// Connect to jetstream
 	js, err := eb.connection.JetStream()
