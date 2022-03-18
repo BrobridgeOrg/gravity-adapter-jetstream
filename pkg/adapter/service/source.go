@@ -3,16 +3,22 @@ package adapter
 import (
 	//"context"
 	//"encoding/json"
+	//"sync/atomic"
 	"fmt"
 	"sync"
 	"time"
 	"unsafe"
 
+	"github.com/BrobridgeOrg/broton"
 	eventbus "github.com/BrobridgeOrg/gravity-adapter-jetstream/pkg/eventbus/service"
+
 	jsoniter "github.com/json-iterator/go"
 	"github.com/nats-io/nats.go"
 	log "github.com/sirupsen/logrus"
+	"github.com/spf13/viper"
 )
+
+var counter uint64
 
 var defaultInfo = SourceInfo{
 	DurableName:         "DefaultGravity",
@@ -38,6 +44,7 @@ type Source struct {
 	pingInterval        int64
 	maxPingsOutstanding int
 	maxReconnects       int
+	store               *broton.Store
 }
 
 var requestPool = sync.Pool{
@@ -96,6 +103,7 @@ func NewSource(adapter *Adapter, name string, sourceInfo *SourceInfo) *Source {
 		pingInterval:        info.PingInterval,
 		maxPingsOutstanding: info.MaxPingsOutstanding,
 		maxReconnects:       info.MaxReconnects,
+		store:               nil,
 	}
 }
 
@@ -115,7 +123,7 @@ func (source *Source) InitSubscription() error {
 	}
 
 	// Subscribe with durable name
-	_, err := jetStreamConn.Subscribe(source.channel, source.HandleMessage, nats.Durable(source.durableName), nats.ManualAck())
+	_, err := jetStreamConn.Subscribe(source.channel, source.HandleMessage, nats.Durable(source.durableName), nats.ManualAck(), nats.MaxAckPending(1)) //, nats.MaxDeliver(1))
 	if err != nil {
 		log.Error(source.durableName)
 		return err
@@ -132,6 +140,27 @@ func (source *Source) Init() error {
 		source.clientID = source.adapter.clientID + "-" + source.name
 	} else {
 		source.clientID = source.durableName + "-" + source.name
+	}
+
+	if viper.GetBool("store.enabled") && viper.GetBool("adapter.batchMode") {
+		// Initializing store
+		log.WithFields(log.Fields{
+			"store": "adapter-" + source.name,
+		}).Info("Initializing store for adapter")
+
+		store, err := source.adapter.storeMgr.GetStore("adapter-" + source.name)
+		if err != nil {
+			return err
+		}
+
+		// register columns
+		columns := []string{"status"}
+		err = store.RegisterColumns(columns)
+		if err != nil {
+			log.Error(err)
+			return err
+		}
+		source.store = store
 	}
 
 	log.WithFields(log.Fields{
@@ -178,31 +207,113 @@ func (source *Source) Init() error {
 
 func (source *Source) HandleMessage(m *nats.Msg) {
 
-	eventName := jsoniter.Get(m.Data, "event").ToString()
-	payload := jsoniter.Get(m.Data, "payload").ToString()
+	connector := source.adapter.app.GetAdapterConnector()
+	// process batch data
+	if viper.GetBool("adapter.batchMode") {
+		// Get The data processed record
 
-	//filter not gravity format
-	if eventName == "" || payload == "" {
-		log.Error("Not gravity's format.")
-		m.Ack()
-		return
-	}
+		meta, _ := m.Metadata()
+		//log.Printf("Deliverd: %d", meta.NumDelivered)
+		//log.Printf("Stream: %d", meta.Sequence.Stream)
 
-	// Preparing request
-	request := requestPool.Get().(*Packet)
-	request.EventName = eventName
-	request.Payload = StrToBytes(payload)
-
-	for {
-		connector := source.adapter.app.GetAdapterConnector()
-		err := connector.Publish(request.EventName, request.Payload, nil)
-		if err != nil {
-			log.Error(err)
-			time.Sleep(time.Second)
-			continue
+		var lsn int64 = 0
+		lsnKey := fmt.Sprintf("%s", "LSN")
+		lastlsn, err := source.store.GetInt64("status", []byte(lsnKey))
+		if err == nil && meta.NumDelivered > 1 {
+			lsn = lastlsn
 		}
-		break
+
+		packets := jsoniter.Get(m.Data, "payloads").GetInterface()
+
+		packetsArr := packets.([]interface{})
+		//log.Info("start at:", lsn)
+		for i, packet := range packetsArr[int(lsn):] {
+			packetAny := jsoniter.Wrap(packet)
+			eventName := packetAny.Get("event").ToString()
+			payload := packetAny.Get("payload").ToString()
+
+			//filter not gravity format
+			if eventName == "" || payload == "" {
+				log.Error("Not gravity's format.")
+				m.Ack()
+				return
+			}
+
+			// Preparing request
+			request := requestPool.Get().(*Packet)
+			request.EventName = eventName
+			request.Payload = StrToBytes(payload)
+
+			// Publish
+			for {
+				err := connector.Publish(request.EventName, request.Payload, nil)
+				if err != nil {
+					log.Error("Error: ", err)
+					time.Sleep(time.Second)
+					continue
+				}
+				requestPool.Put(request)
+				break
+			}
+
+			// The data processed must be recorded
+			for {
+				err := source.store.PutInt64("status", []byte(lsnKey), int64(i+1))
+				if err != nil {
+					log.Error("Failed to update LSN")
+					log.Error(err)
+					time.Sleep(time.Second)
+					continue
+				}
+				break
+			}
+
+		}
+
+		// Reset lsn
+		err = source.store.PutInt64("status", []byte(lsnKey), int64(0))
+		if err != nil {
+			log.Error("Failed to reset LSN")
+			log.Error(err)
+		}
+
+		m.Ack()
+
+	} else {
+
+		/*
+			id := atomic.AddUint64((*uint64)(&counter), 1)
+
+			if id%100 == 0 {
+				log.Info(id)
+			}
+		*/
+
+		eventName := jsoniter.Get(m.Data, "event").ToString()
+		payload := jsoniter.Get(m.Data, "payload").ToString()
+
+		//filter not gravity format
+		if eventName == "" || payload == "" {
+			log.Error("Not gravity's format.")
+			m.Ack()
+			return
+		}
+
+		// Preparing request
+		request := requestPool.Get().(*Packet)
+		request.EventName = eventName
+		request.Payload = StrToBytes(payload)
+
+		for {
+			err := connector.Publish(request.EventName, request.Payload, nil)
+			if err != nil {
+				log.Error(err)
+				time.Sleep(time.Second)
+				continue
+			}
+			break
+		}
+		m.Ack()
+		requestPool.Put(request)
 	}
-	m.Ack()
-	requestPool.Put(request)
 }

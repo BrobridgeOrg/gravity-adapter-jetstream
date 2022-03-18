@@ -9,6 +9,7 @@ maxReconnects = -1
 [adapter]
 adapterID = "jetstream_adapter"
 adapterName = "JetStream Adapter"
+batchMode = true
 
 # Authentication
 appID = "anonymous"
@@ -16,3 +17,8 @@ accessKey = ""
 
 [source]
 config = "./settings/sources.json"
+
+# For batchMode
+[store]
+enabled = true
+path = "./statestore"
