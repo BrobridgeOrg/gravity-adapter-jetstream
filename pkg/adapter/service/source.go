@@ -11,6 +11,7 @@ import (
 
 	"github.com/BrobridgeOrg/broton"
 	eventbus "github.com/BrobridgeOrg/gravity-adapter-jetstream/pkg/eventbus/service"
+	adapter_sdk "github.com/BrobridgeOrg/gravity-sdk/adapter"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/nats-io/nats.go"
@@ -45,6 +46,7 @@ type Source struct {
 	maxPingsOutstanding int
 	maxReconnects       int
 	store               *broton.Store
+	subscription        *nats.Subscription
 }
 
 var requestPool = sync.Pool{
@@ -114,22 +116,33 @@ func (source *Source) InitSubscription() error {
 	if len(source.durableName) == 0 {
 
 		// Subscribe without durable name
-		_, err := jetStreamConn.Subscribe(source.channel, source.HandleMessage, nats.ManualAck())
+		subscription, err := jetStreamConn.Subscribe(source.channel, source.HandleMessage, nats.ManualAck())
 		if err != nil {
 			return err
 		}
+
+		source.subscription = subscription
 
 		return nil
 	}
 
 	// Subscribe with durable name
-	_, err := jetStreamConn.Subscribe(source.channel, source.HandleMessage, nats.Durable(source.durableName), nats.ManualAck(), nats.MaxAckPending(1)) //, nats.MaxDeliver(1))
+	subscription, err := jetStreamConn.Subscribe(source.channel, source.HandleMessage, nats.Durable(source.durableName), nats.ManualAck(), nats.MaxAckPending(1)) //, nats.MaxDeliver(1))
 	if err != nil {
 		log.Error(source.durableName)
 		return err
 	}
 
+	source.subscription = subscription
+
 	return nil
+}
+
+func (source *Source) Stop() error {
+
+	log.Info("Drain subscriber")
+	return source.subscription.Drain()
+	//return source.subscription.Unsubscribe()
 }
 
 func (source *Source) Init() error {
@@ -212,11 +225,8 @@ func (source *Source) HandleMessage(m *nats.Msg) {
 	if viper.GetBool("adapter.batchMode") {
 		// Get The data processed record
 
-		meta, _ := m.Metadata()
-		//log.Printf("Deliverd: %d", meta.NumDelivered)
-		//log.Printf("Stream: %d", meta.Sequence.Stream)
-
 		var lsn int64 = 0
+		meta, _ := m.Metadata()
 		lsnKey := fmt.Sprintf("%s", "LSN")
 		lastlsn, err := source.store.GetInt64("status", []byte(lsnKey))
 		if err == nil && meta.NumDelivered > 1 {
@@ -224,10 +234,10 @@ func (source *Source) HandleMessage(m *nats.Msg) {
 		}
 
 		packets := jsoniter.Get(m.Data, "payloads").GetInterface()
-
 		packetsArr := packets.([]interface{})
-		//log.Info("start at:", lsn)
-		for i, packet := range packetsArr[int(lsn):] {
+
+		requests := make([]*adapter_sdk.Request, 0)
+		for _, packet := range packetsArr[int(lsn):] {
 			packetAny := jsoniter.Wrap(packet)
 			eventName := packetAny.Get("event").ToString()
 			payload := packetAny.Get("payload").ToString()
@@ -240,44 +250,46 @@ func (source *Source) HandleMessage(m *nats.Msg) {
 			}
 
 			// Preparing request
-			request := requestPool.Get().(*Packet)
+			var request adapter_sdk.Request
 			request.EventName = eventName
 			request.Payload = StrToBytes(payload)
 
-			// Publish
-			for {
-				err := connector.Publish(request.EventName, request.Payload, nil)
-				if err != nil {
-					log.Error("Error: ", err)
-					time.Sleep(time.Second)
-					continue
-				}
-				requestPool.Put(request)
-				break
-			}
+			requests = append(requests, &request)
+		}
 
-			// The data processed must be recorded
-			for {
-				err := source.store.PutInt64("status", []byte(lsnKey), int64(i+1))
+		// Publish by batch
+		for {
+			_, count, err := connector.BatchPublish(requests)
+			if err == nil {
+				log.Info("Success: ", len(requests))
+				m.Ack()
+
+				// Reset lsn
+				err = source.store.PutInt64("status", []byte(lsnKey), int64(0))
+				if err != nil {
+					log.Error("Failed to reset LSN")
+					log.Error(err)
+				}
+				break
+			} else if count == 0 && err != nil {
+				log.Error(err)
+				log.Error("Retry.")
+				time.Sleep(time.Second)
+				continue
+			} else if count > 0 && err != nil {
+				log.Error("Count: ", count)
+				log.Error(err)
+				// The data processed must be recorded
+				err := source.store.PutInt64("status", []byte(lsnKey), int64(int(count)+int(lsn)))
 				if err != nil {
 					log.Error("Failed to update LSN")
 					log.Error(err)
 					time.Sleep(time.Second)
-					continue
+					return
 				}
-				break
+
 			}
-
 		}
-
-		// Reset lsn
-		err = source.store.PutInt64("status", []byte(lsnKey), int64(0))
-		if err != nil {
-			log.Error("Failed to reset LSN")
-			log.Error(err)
-		}
-
-		m.Ack()
 
 	} else {
 

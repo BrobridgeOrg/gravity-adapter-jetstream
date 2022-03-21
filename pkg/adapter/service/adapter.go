@@ -69,3 +69,7 @@ func (adapter *Adapter) Init() error {
 
 	return nil
 }
+
+func (adapter *Adapter) Stop() {
+	adapter.sm.Stop()
+}

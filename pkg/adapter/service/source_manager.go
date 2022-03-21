@@ -83,3 +83,9 @@ func (sm *SourceManager) LoadSourceConfig(filename string) (*SourceConfig, error
 
 	return &config, nil
 }
+
+func (sm *SourceManager) Stop() {
+	for _, source := range sm.sources {
+		source.Stop()
+	}
+}
