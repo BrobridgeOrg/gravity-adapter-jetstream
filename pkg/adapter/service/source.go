@@ -234,7 +234,15 @@ func (source *Source) HandleMessage(m *nats.Msg) {
 		}
 
 		packets := jsoniter.Get(m.Data, "payloads").GetInterface()
-		packetsArr := packets.([]interface{})
+		var packetsArr []interface{}
+		if arr, ok := packets.([]interface{}); ok {
+			packetsArr = arr
+		} else {
+			log.Warn("Not batch packets.")
+			m.Ack()
+			return
+		}
+		//packetsArr := packets.([]interface{})
 
 		requests := make([]*adapter_sdk.Request, 0)
 		for _, packet := range packetsArr[int(lsn):] {
@@ -272,7 +280,9 @@ func (source *Source) HandleMessage(m *nats.Msg) {
 				}
 				break
 			} else if count == 0 && err != nil {
-				log.Error(err)
+				meta, _ := m.Metadata()
+				log.Error(err, " stream seq: ", meta.Sequence.Stream)
+				log.Error(string(m.Data))
 				log.Error("Retry.")
 				time.Sleep(time.Second)
 				continue
