@@ -9,6 +9,7 @@ import (
 	"time"
 	"unsafe"
 
+	//"github.com/BrobridgeOrg/broton"
 	"github.com/BrobridgeOrg/broton"
 	eventbus "github.com/BrobridgeOrg/gravity-adapter-jetstream/pkg/eventbus/service"
 	adapter_sdk "github.com/BrobridgeOrg/gravity-sdk/adapter"
@@ -47,11 +48,18 @@ type Source struct {
 	maxReconnects       int
 	store               *broton.Store
 	subscription        *nats.Subscription
+	//stopping            bool
 }
 
 var requestPool = sync.Pool{
 	New: func() interface{} {
 		return &Packet{}
+	},
+}
+
+var sdkRequestPool = sync.Pool{
+	New: func() interface{} {
+		return &adapter_sdk.Request{}
 	},
 }
 
@@ -106,6 +114,7 @@ func NewSource(adapter *Adapter, name string, sourceInfo *SourceInfo) *Source {
 		maxPingsOutstanding: info.MaxPingsOutstanding,
 		maxReconnects:       info.MaxReconnects,
 		store:               nil,
+		//stopping:            false,
 	}
 }
 
@@ -116,7 +125,7 @@ func (source *Source) InitSubscription() error {
 	if len(source.durableName) == 0 {
 
 		// Subscribe without durable name
-		subscription, err := jetStreamConn.Subscribe(source.channel, source.HandleMessage, nats.ManualAck())
+		subscription, err := jetStreamConn.Subscribe(source.channel, source.HandleMessage, nats.MaxAckPending(1), nats.ManualAck())
 		if err != nil {
 			return err
 		}
@@ -140,9 +149,21 @@ func (source *Source) InitSubscription() error {
 
 func (source *Source) Stop() error {
 
-	log.Info("Drain subscriber")
-	return source.subscription.Drain()
-	//return source.subscription.Unsubscribe()
+	/*
+		log.Info("Stop subscriber")
+		//return source.subscription.Drain()
+		source.stopping = true
+
+			//stop source
+			sourceConn := source.eventBus.GetConnection()
+			sourceConn.Flush()
+
+			//stop target
+			targetConn := source.adapter.app.GetAdapterConnector()
+			<-targetConn.PublishComplete()
+	*/
+	return nil
+
 }
 
 func (source *Source) Init() error {
@@ -155,26 +176,28 @@ func (source *Source) Init() error {
 		source.clientID = source.durableName + "-" + source.name
 	}
 
-	if viper.GetBool("store.enabled") && viper.GetBool("adapter.batchMode") {
-		// Initializing store
-		log.WithFields(log.Fields{
-			"store": "adapter-" + source.name,
-		}).Info("Initializing store for adapter")
+	/*
+		if viper.GetBool("store.enabled") && viper.GetBool("adapter.batchMode") {
+			// Initializing store
+			log.WithFields(log.Fields{
+				"store": "adapter-" + source.name,
+			}).Info("Initializing store for adapter")
 
-		store, err := source.adapter.storeMgr.GetStore("adapter-" + source.name)
-		if err != nil {
-			return err
-		}
+			store, err := source.adapter.storeMgr.GetStore("adapter-" + source.name)
+			if err != nil {
+				return err
+			}
 
-		// register columns
-		columns := []string{"status"}
-		err = store.RegisterColumns(columns)
-		if err != nil {
-			log.Error(err)
-			return err
+			// register columns
+			columns := []string{"status"}
+			err = store.RegisterColumns(columns)
+			if err != nil {
+				log.Error(err)
+				return err
+			}
+			source.store = store
 		}
-		source.store = store
-	}
+	*/
 
 	log.WithFields(log.Fields{
 		"source":      source.name,
@@ -220,18 +243,29 @@ func (source *Source) Init() error {
 
 func (source *Source) HandleMessage(m *nats.Msg) {
 
+	/*
+		if source.stopping {
+			log.Warn("stopping ...")
+			time.Sleep(time.Second)
+			return
+		}
+	*/
+
 	connector := source.adapter.app.GetAdapterConnector()
 	// process batch data
 	if viper.GetBool("adapter.batchMode") {
 		// Get The data processed record
 
-		var lsn int64 = 0
-		meta, _ := m.Metadata()
-		lsnKey := fmt.Sprintf("%s", "LSN")
-		lastlsn, err := source.store.GetInt64("status", []byte(lsnKey))
-		if err == nil && meta.NumDelivered > 1 {
-			lsn = lastlsn
-		}
+		/*
+			var lsn int64 = 0
+			meta, _ := m.Metadata()
+			lsnKey := fmt.Sprintf("%s-%s", source.name, "LSN")
+			lastlsn, err := source.store.GetInt64("status", []byte(lsnKey))
+			if err == nil && meta.NumDelivered > 1 {
+				log.Infof("Using %s lsn %v", lsnKey, lastlsn)
+				lsn = lastlsn
+			}
+		*/
 
 		packets := jsoniter.Get(m.Data, "payloads").GetInterface()
 		var packetsArr []interface{}
@@ -245,7 +279,8 @@ func (source *Source) HandleMessage(m *nats.Msg) {
 		//packetsArr := packets.([]interface{})
 
 		requests := make([]*adapter_sdk.Request, 0)
-		for _, packet := range packetsArr[int(lsn):] {
+		//for _, packet := range packetsArr[int(lsn):] {
+		for _, packet := range packetsArr {
 			packetAny := jsoniter.Wrap(packet)
 			eventName := packetAny.Get("event").ToString()
 			payload := packetAny.Get("payload").ToString()
@@ -258,48 +293,67 @@ func (source *Source) HandleMessage(m *nats.Msg) {
 			}
 
 			// Preparing request
-			var request adapter_sdk.Request
+			//var request adapter_sdk.Request
+			request := sdkRequestPool.Get().(*adapter_sdk.Request)
 			request.EventName = eventName
 			request.Payload = StrToBytes(payload)
 
-			requests = append(requests, &request)
+			requests = append(requests, request)
 		}
 
 		// Publish by batch
-		for {
-			_, count, err := connector.BatchPublish(requests)
-			if err == nil {
-				log.Info("Success: ", len(requests))
-				m.Ack()
+		for i, request := range requests {
+			for {
+				sourceMeta, _ := m.Metadata()
+				meta := make(map[string]interface{})
+				meta["Msg-Id"] = fmt.Sprintf("%s-%s-%s-%d", sourceMeta.Stream, sourceMeta.Consumer, sourceMeta.Sequence.Stream, i)
+				err := connector.Publish(request.EventName, request.Payload, meta)
+				if err != nil {
+					log.Error(err, " stream seq: ", sourceMeta.Sequence.Stream, " retry ...")
+					time.Sleep(time.Second)
+					continue
+				}
 
-				// Reset lsn
+				/*
+					// Update lsn
+					for {
+						lsn = lsn + int64(1)
+						err := source.store.PutInt64("status", []byte(lsnKey), lsn)
+						if err != nil {
+							log.Error("Failed to update LSN")
+							log.Error(err)
+							time.Sleep(time.Second)
+							continue
+						}
+
+						break
+					}
+				*/
+
+				sdkRequestPool.Put(request)
+
+				break
+			}
+		}
+		<-connector.PublishComplete()
+		log.Info("Success: ", len(requests))
+
+		/*
+			// Reset lsn
+			for {
 				err = source.store.PutInt64("status", []byte(lsnKey), int64(0))
 				if err != nil {
 					log.Error("Failed to reset LSN")
 					log.Error(err)
-				}
-				break
-			} else if count == 0 && err != nil {
-				meta, _ := m.Metadata()
-				log.Error(err, " stream seq: ", meta.Sequence.Stream)
-				log.Error(string(m.Data))
-				log.Error("Retry.")
-				time.Sleep(time.Second)
-				continue
-			} else if count > 0 && err != nil {
-				log.Error("Count: ", count)
-				log.Error(err)
-				// The data processed must be recorded
-				err := source.store.PutInt64("status", []byte(lsnKey), int64(int(count)+int(lsn)))
-				if err != nil {
-					log.Error("Failed to update LSN")
-					log.Error(err)
 					time.Sleep(time.Second)
-					return
+					continue
 				}
-
+				m.Ack()
+				break
 			}
-		}
+
+		*/
+		m.Ack()
 
 	} else {
 
@@ -327,7 +381,10 @@ func (source *Source) HandleMessage(m *nats.Msg) {
 		request.Payload = StrToBytes(payload)
 
 		for {
-			err := connector.Publish(request.EventName, request.Payload, nil)
+			sourceMeta, _ := m.Metadata()
+			meta := make(map[string]interface{})
+			meta["Msg-Id"] = fmt.Sprintf("%s-%s-%s", sourceMeta.Stream, sourceMeta.Consumer, sourceMeta.Sequence.Stream)
+			err := connector.Publish(request.EventName, request.Payload, meta)
 			if err != nil {
 				log.Error(err)
 				time.Sleep(time.Second)
@@ -335,6 +392,7 @@ func (source *Source) HandleMessage(m *nats.Msg) {
 			}
 			break
 		}
+		<-connector.PublishComplete()
 		m.Ack()
 		requestPool.Put(request)
 	}

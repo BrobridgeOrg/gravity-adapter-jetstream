@@ -4,7 +4,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	adapter_service "github.com/BrobridgeOrg/gravity-adapter-jetstream/pkg/adapter/service"
 	gravity_adapter "github.com/BrobridgeOrg/gravity-sdk/adapter"
@@ -55,8 +54,8 @@ func (a *AppInstance) Uninit() {
 func (a *AppInstance) Run() error {
 
 	<-a.done
-	a.adapter.Stop()
-	time.Sleep(5 * time.Second)
+	//a.adapter.Stop()
+	//time.Sleep(5 * time.Second)
 	log.Error("Bye!")
 
 	return nil
